@@ -222,6 +222,27 @@ def api_keys():
         
         return jsonify({"status": "success", "count": len(keys), "keys": keys})
 
+@app.route('/api/api-keys/<key_id>', methods=['DELETE'])
+def revoke_api_key(key_id):
+    """Revoke an API key (sets is_active=0). Wallet must match owner."""
+    db = get_db()
+    cursor = db.cursor()
+ 
+    wallet = request.args.get('wallet', '').lower()
+    if not wallet:
+        return jsonify({"status": "error", "error": "wallet parameter required"}), 400
+ 
+    cursor.execute('''
+        UPDATE api_keys SET is_active = 0
+        WHERE key_id = ? AND wallet = ? AND is_active = 1
+    ''', (key_id, wallet))
+    db.commit()
+ 
+    if cursor.rowcount == 0:
+        return jsonify({"status": "error", "error": "Key not found or already revoked"}), 404
+ 
+    return jsonify({"status": "success", "message": "Key revoked", "key_id": key_id})
+
 # Chat
 @app.route('/api/chat', methods=['POST'])
 def chat():
