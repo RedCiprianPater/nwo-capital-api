@@ -274,6 +274,75 @@ def revoke_api_key(key_id):
 
     return jsonify({"status": "success", "message": "Key revoked", "key_id": key_id})
 
+# ============ PUBLIC: API key validation (used by other NWO services) ============
+#
+# This endpoint is INTENTIONALLY not wrapped with @require_wallet because it
+# is called by other NWO services (e.g. nwo-simulation-api) that don't have
+# a wallet signature. The credential being validated is the API key in the
+# request body — that itself is the auth.
+#
+# This is safe because:
+#   1. The only thing it returns is { valid, wallet, key_id, name } — no
+#      sensitive material like the original key.
+#   2. It only confirms ownership; it does not grant any session or token.
+#   3. Rate limiting at the Render edge prevents brute force.
+#
+# CALLERS: nwo-simulation-api validates X-API-Key / Authorization: Bearer
+# headers against this endpoint to figure out which guardian wallet "owns"
+# a sim job, so each guardian only sees their own environments / sims.
+
+@app.route('/api/api-keys/validate', methods=['POST'])
+def validate_api_key():
+    """Validate a raw API key string. Returns { valid, wallet, key_id, name }.
+
+    Body: { "key": "the-raw-api-key-string" }
+
+    Designed to be called by other NWO services (sim API, future: print
+    quote API, etc). NOT wallet-signed — the key itself is the credential.
+    """
+    data = request.get_json(silent=True) or {}
+    raw_key = (data.get('key') or '').strip()
+    if not raw_key:
+        return jsonify({"valid": False, "error": "missing key"}), 400
+
+    # We store SHA-256 hash, not the raw key — so hash the input and look it up
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute('''
+        SELECT key_id, wallet, name, is_active
+        FROM api_keys
+        WHERE api_key_hash = ?
+    ''', (key_hash,))
+    row = cursor.fetchone()
+
+    if not row:
+        return jsonify({"valid": False, "error": "key not found"}), 200
+
+    key_id, wallet, name, is_active = row[0], row[1], row[2], row[3]
+
+    if not is_active:
+        return jsonify({"valid": False, "error": "key revoked"}), 200
+
+    # Update usage_count and last_used so guardians can see usage in their dashboard
+    try:
+        cursor.execute('''
+            UPDATE api_keys
+            SET usage_count = usage_count + 1, last_used = CURRENT_TIMESTAMP
+            WHERE api_key_hash = ?
+        ''', (key_hash,))
+        db.commit()
+    except Exception:
+        pass  # non-fatal; usage tracking shouldn't block validation
+
+    return jsonify({
+        "valid": True,
+        "wallet": wallet,
+        "key_id": key_id,
+        "name": name,
+    })
+
 # Chat
 @app.route('/api/chat', methods=['POST'])
 @require_wallet
