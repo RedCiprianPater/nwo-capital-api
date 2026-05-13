@@ -17,6 +17,8 @@
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
+from blueprints.platform_bp import platform_bp   # adjust path if you put it at repo root
+app.register_blueprint(platform_bp, url_prefix='/api')
 from auth_patch import require_wallet, register_auth_routes
 import sqlite3
 import json
