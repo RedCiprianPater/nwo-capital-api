@@ -17,9 +17,8 @@
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from blueprints.platform_bp import platform_bp   # adjust path if you put it at repo root
-app.register_blueprint(platform_bp, url_prefix='/api')
 from auth_patch import require_wallet, register_auth_routes
+from blueprints.platform_bp import platform_bp  # adjust path if you put it at repo root
 import sqlite3
 import json
 import hashlib
@@ -48,6 +47,9 @@ CORS(app, resources={
 # Register the /api/auth/echo smoke-test endpoint defined in auth_patch
 register_auth_routes(app)
 
+# Register the platform blueprint (must come AFTER `app` is created)
+app.register_blueprint(platform_bp, url_prefix='/api')
+
 # Database setup
 DB_PATH = os.getenv("DATABASE_URL", "nwo_api.db")
 
@@ -69,7 +71,7 @@ def init_db():
     with app.app_context():
         db = get_db()
         cursor = db.cursor()
-        
+
         # API Keys table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -86,7 +88,7 @@ def init_db():
                 is_active INTEGER DEFAULT 1
             )
         ''')
-        
+
         # Chat messages table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_messages (
@@ -97,7 +99,7 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         # Model usage table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS model_usage (
@@ -110,7 +112,7 @@ def init_db():
                 UNIQUE(wallet, model_id)
             )
         ''')
-        
+
         # IoT Networks table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS iot_networks (
@@ -124,7 +126,7 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         # Robots table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS robots (
@@ -138,7 +140,7 @@ def init_db():
                 last_seen TIMESTAMP
             )
         ''')
-        
+
         # Missions table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS missions (
@@ -154,7 +156,7 @@ def init_db():
                 completed_at TIMESTAMP
             )
         ''')
-        
+
         db.commit()
         print("✅ Database initialized")
 
