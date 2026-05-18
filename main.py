@@ -1,11 +1,13 @@
 # NWO Robotics API - Render Deployment
 # FastAPI fallback for nwo.capital PHP APIs
-# v2.1.0 — fixes:
+# v2.2.0 — fixes:
 #   - wallet now read from X-NWO-Wallet header (body fallback kept for compat)
 #   - DB_PATH defaults to /data/nwo_api.db (Render persistent disk at /data)
 #   - key_preview field added to GET /api-keys response
 #   - robots GET returns both id and robot_id fields for frontend compat
 #   - chat endpoint reads robot_id from body, wallet from header
+#   - POST /api-keys/validate added — used by Cloudflare Worker sim key check
+#   - CORS updated: nwo.ciprianpater.workers.dev + *.workers.dev added
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,16 +23,18 @@ import os
 app = FastAPI(
     title="NWO Robotics API",
     description="FastAPI fallback for NWO Robotics ecosystem",
-    version="2.1.0"
+    version="2.2.0"
 )
 
-# CORS - Allow HF Space and nwo.capital
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://nwo.capital",
         "https://CPater-nwo-capital.hf.space",
         "https://*.hf.space",
+        "https://nwo.ciprianpater.workers.dev",   # Cloudflare Worker (sim key validation)
+        "https://*.workers.dev",                   # any future Workers on this account
         "http://localhost:3000",
         "http://localhost:8000",
     ],
@@ -41,19 +45,18 @@ app.add_middleware(
 
 # ── Database ──────────────────────────────────────────────────────────────────
 # Default: /data/nwo_api.db  (Render persistent disk, mounted at /data)
-# Override via DATABASE_URL env var if needed.
+# Set DATABASE_URL=/data/nwo_api.db in Render environment variables.
 DB_PATH = os.getenv("DATABASE_URL", "/data/nwo_api.db")
 
 
 def init_db():
     """Initialize SQLite database with all tables."""
-    # Ensure the directory exists (needed for /data on first deploy)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Enable WAL mode for better concurrent read/write
+    # WAL mode for better concurrent read/write
     cursor.execute("PRAGMA journal_mode=WAL")
 
     cursor.execute('''
@@ -178,8 +181,11 @@ def resolve_wallet(header_wallet: Optional[str], body_wallet: Optional[str]) -> 
 
 class ApiKeyCreate(BaseModel):
     name: str
-    wallet: Optional[str] = None          # fallback; prefer X-NWO-Wallet header
+    wallet: Optional[str] = None        # fallback; prefer X-NWO-Wallet header
 
+class ApiKeyValidate(BaseModel):
+    api_key: str                        # raw key as issued on creation
+    wallet: Optional[str] = None        # if provided, ownership is also verified
 
 class ChatMessage(BaseModel):
     message: str
@@ -187,16 +193,13 @@ class ChatMessage(BaseModel):
     wallet: Optional[str] = None
     history: Optional[List[Dict]] = []
 
-
 class ModelUsage(BaseModel):
     model_id: str
     wallet: Optional[str] = None
 
-
 class IoTNetworkCreate(BaseModel):
     name: str
     wallet: Optional[str] = None
-
 
 class RobotCreate(BaseModel):
     name: Optional[str] = None
@@ -204,7 +207,6 @@ class RobotCreate(BaseModel):
     description: Optional[str] = None
     agent_address: Optional[str] = None
     wallet: Optional[str] = None
-
 
 class MissionCreate(BaseModel):
     robot_id: str
@@ -224,8 +226,8 @@ async def create_api_key(
     """Create a new API key scoped to the connected wallet."""
     wallet = resolve_wallet(x_nwo_wallet, data.wallet)
 
-    key_id  = generate_id("KEY")
-    api_key = "nwo_" + secrets.token_urlsafe(32)
+    key_id   = generate_id("KEY")
+    api_key  = "nwo_" + secrets.token_urlsafe(32)
     key_hash = hashlib.sha256(api_key.encode()).hexdigest()
 
     cursor = db.cursor()
@@ -243,8 +245,8 @@ async def create_api_key(
         "key_id":      key_id,
         "id":          key_id,
         "name":        data.name,
-        "api_key":     api_key,       # shown once only — frontend stores in justCreated
-        "key":         api_key,       # alias so both data.key and data.api_key work
+        "api_key":     api_key,         # shown once — frontend stores in justCreated
+        "key":         api_key,         # alias so data.key and data.api_key both work
         "key_prefix":  api_key[:12],
         "key_preview": api_key[:12] + "…" + api_key[-4:],
         "created_at":  datetime.now().isoformat(),
@@ -255,7 +257,7 @@ async def create_api_key(
 async def list_api_keys(
     db: sqlite3.Connection = Depends(get_db),
     x_nwo_wallet: Optional[str] = Header(None),
-    wallet: Optional[str] = None,     # query-param fallback
+    wallet: Optional[str] = None,       # query-param fallback
 ):
     """List active API keys for the connected wallet (full keys never returned)."""
     resolved = resolve_wallet(x_nwo_wallet, wallet)
@@ -283,6 +285,61 @@ async def list_api_keys(
         })
 
     return {"status": "success", "count": len(keys), "keys": keys}
+
+
+@app.post("/api-keys/validate")
+async def validate_api_key(
+    data: ApiKeyValidate,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """
+    Validate a raw API key submitted by a Cloudflare Worker or agent.
+    Called by nwo.ciprianpater.workers.dev when an agent attaches a SIM key.
+
+    - Hashes the submitted key and looks it up in the DB.
+    - If `wallet` is provided in the body, also verifies ownership.
+    - Bumps usage_count and last_used on success.
+    - Never returns the hash or the full key — only a masked preview.
+    """
+    if not data.api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    key_hash = hashlib.sha256(data.api_key.encode()).hexdigest()
+
+    cursor = db.cursor()
+    cursor.execute('''
+        SELECT key_id, wallet, name, key_prefix, key_suffix, usage_count
+        FROM api_keys
+        WHERE api_key_hash = ? AND is_active = 1
+    ''', (key_hash,))
+    row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+
+    # Optional wallet ownership check
+    if data.wallet and row["wallet"] != data.wallet.strip().lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Key does not belong to the provided wallet"
+        )
+
+    # Bump usage
+    cursor.execute('''
+        UPDATE api_keys
+        SET usage_count = usage_count + 1, last_used = ?
+        WHERE key_id = ?
+    ''', (datetime.now().isoformat(), row["key_id"]))
+    db.commit()
+
+    return {
+        "valid":       True,
+        "key_id":      row["key_id"],
+        "name":        row["name"],
+        "key_preview": row["key_prefix"] + "…" + row["key_suffix"],
+        "wallet":      row["wallet"],
+        "usage_count": row["usage_count"] + 1,
+    }
 
 
 @app.delete("/api-keys/{key_id}")
@@ -351,7 +408,7 @@ async def chat(
     return {
         "status":    "success",
         "response":  ai_response,
-        "reply":     ai_response,   # alias — frontend checks both
+        "reply":     ai_response,       # alias — frontend checks both
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -422,10 +479,10 @@ async def track_model_usage(
     wallet = resolve_wallet(x_nwo_wallet, data.wallet)
 
     model_costs = {
-        "gpt-4":   0.0001,
+        "gpt-4":    0.0001,
         "claude-3": 0.00015,
-        "llama-3": 0.00005,
-        "timesfm": 0.00002,
+        "llama-3":  0.00005,
+        "timesfm":  0.00002,
     }
     cost = model_costs.get(data.model_id, 0.0001)
     now  = datetime.now().isoformat()
@@ -480,9 +537,14 @@ async def list_iot_networks(
     ''', (resolved,))
 
     networks = [
-        {"id": r["network_id"], "name": r["name"], "status": r["status"],
-         "device_count": r["device_count"], "data_points": r["data_points"],
-         "created_at": r["created_at"]}
+        {
+            "id":           r["network_id"],
+            "name":         r["name"],
+            "status":       r["status"],
+            "device_count": r["device_count"],
+            "data_points":  r["data_points"],
+            "created_at":   r["created_at"],
+        }
         for r in cursor.fetchall()
     ]
     return {"status": "success", "count": len(networks), "networks": networks}
@@ -617,7 +679,7 @@ async def health_check():
     return {
         "status":    "healthy",
         "service":   "nwo-robotics-api",
-        "version":   "2.1.0",
+        "version":   "2.2.0",
         "db_path":   DB_PATH,
         "timestamp": datetime.now().isoformat(),
     }
@@ -627,16 +689,17 @@ async def health_check():
 async def root():
     return {
         "service":     "NWO Robotics API",
-        "version":     "2.1.0",
+        "version":     "2.2.0",
         "description": "FastAPI fallback for NWO Robotics ecosystem",
         "endpoints": {
-            "api_keys":    "/api-keys  (GET, POST, DELETE /{key_id})",
-            "chat":        "/chat (POST), /chat/history (GET)",
-            "model_usage": "/model-usage (GET), /model-usage/track (POST)",
-            "iot_networks":"/iot-networks (GET, POST)",
-            "robots":      "/robots (GET, POST)",
-            "missions":    "/missions (GET, POST)",
-            "health":      "/health",
+            "api_keys":          "/api-keys  (GET, POST, DELETE /{key_id})",
+            "api_keys_validate": "/api-keys/validate  (POST — Worker/agent sim key check)",
+            "chat":              "/chat (POST), /chat/history (GET)",
+            "model_usage":       "/model-usage (GET), /model-usage/track (POST)",
+            "iot_networks":      "/iot-networks (GET, POST)",
+            "robots":            "/robots (GET, POST)",
+            "missions":          "/missions (GET, POST)",
+            "health":            "/health",
         },
     }
 
