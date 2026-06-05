@@ -459,7 +459,7 @@ def create_api_key(data: ApiKeyCreate, x_nwo_wallet: Optional[str] = Header(None
 def list_api_keys(x_nwo_wallet: Optional[str] = Header(None), wallet: Optional[str] = None):
     resolved = resolve_wallet(x_nwo_wallet, wallet)
     rows = db_query(
-        """SELECT id, name, key_prefix, key_suffix, usage_count, created_at, is_active
+        """SELECT id, name, key_prefix, key_suffix, usage_count, created_at, is_active, agent_id
            FROM api_keys WHERE wallet=%s AND is_active=true ORDER BY created_at DESC""",
         (resolved,),
     )
@@ -469,6 +469,8 @@ def list_api_keys(x_nwo_wallet: Optional[str] = Header(None), wallet: Optional[s
         "key_preview": (r["key_prefix"] or "") + "…" + (r["key_suffix"] or ""),
         "usage_count": r["usage_count"], "created_at": str(r["created_at"]),
         "is_active": bool(r["is_active"]),
+        # agent_id set => key was minted by/for an AI agent (automated system key)
+        "agent_id": r["agent_id"], "is_agent": r["agent_id"] is not None,
     } for r in rows]
     return {"status": "success", "count": len(keys), "keys": keys}
 
