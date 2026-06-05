@@ -1,4 +1,7 @@
-flask>=3.0.0
-flask-cors>=4.0.0
-gunicorn>=21.0.0
-eth-account>=0.10.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+psycopg2-binary==2.9.9
+httpx==0.27.2
+# Only needed when NWO_AUTH_REQUIRED=true (server-side signature verification)
+eth-account==0.13.4
