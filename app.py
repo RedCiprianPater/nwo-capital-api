@@ -61,6 +61,14 @@ DATABASE_URL  = os.getenv("DATABASE_URL", "")  # Supabase Postgres connection st
 AUTH_REQUIRED = os.getenv("NWO_AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
 PORT          = int(os.getenv("PORT", "8000"))
 
+# v0.7.5 · Enactivist feedback channel to CHAINSTATE worker (Paper V §6.4)
+# Set on Render: ENACTIVIST_BEARER = <same 32-byte hex used by CHAINSTATE worker>
+CHAINSTATE_WORKER_URL = os.getenv(
+    "CHAINSTATE_WORKER_URL",
+    "https://chainstate-worker.ciprianpater.workers.dev"
+)
+ENACTIVIST_BEARER = os.getenv("ENACTIVIST_BEARER", "")
+
 # Downstream layered services. Override any of these in the Render dashboard.
 SERVICES: Dict[str, str] = {
     "parts_gallery":   os.getenv("SVC_PARTS_GALLERY",   "https://nwo-parts-gallery.onrender.com"),
@@ -1457,6 +1465,112 @@ async def robotics_cs(path: str, request: Request):
             body = None
     return await proxy("robotics_cs", "/" + path, request.method,
                        params=dict(request.query_params), json_body=body)
+
+
+# =============================================================================
+# v0.7.5 · Enactivist feedback channel to CHAINSTATE (Paper V §6.4 · Theorem 9)
+# =============================================================================
+# Closes the prediction-action-correction loop. Any NWO Robotics workflow that
+# executes a robotic action originally initiated by a CHAINSTATE query calls
+# this endpoint after the action completes with:
+#   * originating_query_hash — the CHAINSTATE receipt content hash from the
+#                              query that triggered the action
+#   * predicted_outcome      — what the substrate predicted would happen
+#   * observed_outcome       — what actually happened
+#   * error_metric           — [0.0, 1.0] scalar distance between the two
+#   * category_refinements   — optional ontology deltas the outcome suggests
+#
+# We forward the packet to the CHAINSTATE worker's /enactivist/feedback
+# endpoint. When error_metric > ENACTIVIST_THRESHOLD on the worker side
+# (default 0.35), the worker anchors an ENACTIVIST_EVENT via the anchor
+# microservice, updates reputation, and proposes an ontology delta.
+#
+# Nothing in the existing NWO Robotics API changes. This is outbound emit
+# only. Downstream services and payment flows are untouched.
+# =============================================================================
+
+class RoboticsFeedbackBody(BaseModel):
+    """
+    Prediction-outcome packet for the enactivist channel (Paper V §6.4).
+    """
+    originating_query_hash: str
+    predicted_outcome: Dict[str, Any]
+    observed_outcome:  Dict[str, Any]
+    error_metric:      float                          # 0.0 = perfect · 1.0 = maximum divergence
+    category_refinements: Optional[List[Dict[str, Any]]] = None
+    source: Optional[str] = "robotics"                # "robotics" | "neuro"
+
+
+@app.post("/api/enactivist/emit")
+async def enactivist_emit(
+    body: RoboticsFeedbackBody,
+    x_nwo_wallet: Optional[str] = Header(None),
+):
+    """
+    Forward a prediction-outcome packet from a robotic action to the
+    CHAINSTATE worker's enactivist feedback channel.
+
+    Auth: standard wallet resolution (lenient by default, per
+    NWO_AUTH_REQUIRED). Body payload is server-side wrapped and signed
+    with the Bearer token; the caller does not need to know the token.
+
+    Returns:
+      {
+        forwarded: bool,
+        chainstate_status: int,
+        chainstate_response: dict | str,
+        source: str,
+        exceeded_threshold: bool | None    (populated from worker response)
+      }
+    """
+    # Standard wallet resolution — consistent with the rest of the API
+    resolve_wallet(x_nwo_wallet, None)
+
+    # Clamp error_metric to [0, 1]
+    err = max(0.0, min(1.0, float(body.error_metric)))
+
+    # Build the payload in the shape the worker expects (see edge-worker.js
+    # tomProcessEnactivistFeedback in /home/claude/v075/edge-worker.js)
+    payload: Dict[str, Any] = {
+        "source":     (body.source or "robotics").strip().lower(),
+        "query_hash": body.originating_query_hash,
+        "prediction": body.predicted_outcome,
+        "outcome":    body.observed_outcome,
+        "error":      err,
+        "category_hints": body.category_refinements or [],
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if ENACTIVIST_BEARER:
+        headers["Authorization"] = f"Bearer {ENACTIVIST_BEARER}"
+
+    url = CHAINSTATE_WORKER_URL.rstrip("/") + "/enactivist/feedback"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504,
+                             detail="CHAINSTATE worker timed out — feedback not delivered")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502,
+                             detail=f"CHAINSTATE worker unreachable: {e}")
+
+    # Parse response body — worker returns JSON
+    try:
+        parsed = resp.json()
+    except Exception:
+        parsed = {"raw": resp.text[:500]}
+
+    exceeded = parsed.get("exceeded_threshold") if isinstance(parsed, dict) else None
+
+    return {
+        "forwarded": 200 <= resp.status_code < 300,
+        "chainstate_status": resp.status_code,
+        "chainstate_response": parsed,
+        "source": payload["source"],
+        "exceeded_threshold": exceeded,
+    }
 
 
 # =============================================================================
